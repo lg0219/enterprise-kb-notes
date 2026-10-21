@@ -254,27 +254,36 @@ Milvus 公开榜单：`Qwen3-VL-Embedding-2B` 跨模态检索 R@1 = **0.945**，
 ## 8. 推荐架构
 
 ```
-私有云盘 API
+── 入库流（离线 / 定时）──────────────────────────
+私有云盘 API / 本地文档
      ↓
-   下载
-     ↓
-[MinerU]  ← 解析层（新增）
+[MinerU]      ← 解析层（新增）
      ↓
   Markdown
      ↓
-[自建切分]  ← 可复用 OpenClaw 逻辑，或自己接管（见下）
+[自建切分]     ← 企业制度场景建议自己接管（见下）
      ↓
    chunk
      ↓
-[BGE-M3]  ← 嵌入（换掉 EmbeddingGemma）
+[BGE-M3]       ← 嵌入（换掉 EmbeddingGemma）
      ↓
    指纹
      ↓
-[Qdrant]  ← 向量库（独立于 OpenClaw 的 memory 库）
-     ↓
-   暴露检索工具 / MCP
-     ↓
-[OpenClaw]  ← 编排 + 对话出口（钉钉）
+[Qdrant]       ← 向量库（独立于 OpenClaw 的 memory 库）
+
+── 查询流（在线）───────────────────────────────
+[编排层]  OpenClaw / Codex / workbuddy / 自建 agent   ← 可随时替换
+   │      MCP (streamable-http)  或  HTTP API
+   ↓
+┌────────── 知识服务（独立进程，与编排层解耦）──────────┐
+│  MCP tools   : kb_search / kb_get_source              │
+│  身份校验    : 调用方 token → 可见范围                 │
+│  权限过滤    : 检索时裁剪候选（不是生成后过滤）           │
+│  HTTP API    : /ask /search /health（给系统与批处理用）  │
+│  审计        : 哪个 agent、代表谁、问了什么、命中哪些块   │
+└────────────────────────────────────────────────────┘
+   ↓
+ 检索结果 → 编排层 → 大模型 → 答案
 ```
 
 ### 关键设计取舍
@@ -290,7 +299,96 @@ OpenClaw 的 memory 库装的是"我的记忆"；企业知识库存的是"公司
 
 ---
 
-## 9. 两条落地路线
+## 9. 编排层可换：知识服务的解耦设计
+
+> 本章回答：**如果不是由 OpenClaw 编排，而由 Codex / workbuddy / 自建 agent 编排，架构要怎么变？**
+> 结论：**这反而是更好的架构**。知识库应做成独立"知识服务"，用标准接口暴露，编排层只是它的一个消费者。
+
+### 9.1 目标形态
+
+```
+                    ┌─ OpenClaw   (mcp.servers)
+                    ├─ Codex      (codex mcp add)
+知识服务 (MCP/HTTP) ─┼─ workbuddy
+                    └─ 自建 agent
+```
+
+**一个实现，多个编排器** —— 这是最大的好处。换编排器 = 改一行连接配置，知识库代码零改动。
+
+### 9.2 为什么 MCP 是最合适的接口（已核实）
+
+| 事实 | 证据来源 |
+|---|---|
+| Codex 原生支持接 MCP server | `codex mcp add <NAME> --url <url>`（本机 codex-cli 0.162.1） |
+| OpenClaw 可作为 MCP 客户端 | 顶层 `mcp.servers` 支持 `command`/`args`/`env`/`cwd`/`url`/`transport`/`headers`/`auth`/`oauth`/`sslVerify`/`clientCert`/`clientKey`/`toolFilter` |
+| OpenClaw 还能反向暴露自己 | `openclaw mcp serve` —— 把 OpenClaw 频道以 MCP stdio 暴露给别的 MCP 客户端 |
+| **修正**：顶层 `mcp.servers` **有 `oauth` 字段** | config schema 确认。与 `nodeHost.mcp.servers`（v1 路径）**明确不支持 OAuth** 是两条不同路径，不可混为一谈 |
+
+### 9.3 什么变、什么不变
+
+| 层 | 是否受编排层影响 |
+|---|---|
+| 解析（MinerU）、切块、嵌入（BGE-M3）、向量库（Qdrant） | ❌ **完全不变** |
+| 权限模型、增量同步、索引、审计 | ❌ 不变 |
+| **"谁来调检索"** | ✅ 变了：从编排器内部调用 → 标准接口调用 |
+
+**唯一需要重新设计的是「身份传递」**：多个编排器时，"谁在问"必须能传进去，否则权限过滤无从谈起。
+做法：**每个调用方带自己的身份 token，服务端据此判定可见范围**。这也顺带解决了审计 —— 服务端天然能记录"哪个 agent、代表谁、问了什么、命中了哪些块"。
+
+### 9.4 三种实现方式
+
+**A. HTTP API + 每个编排器配一个 skill**
+- ✅ 已有基础：`lg0219/rag-kb` 的 `api_server.py`（`/ask`、`/health`）
+- 优点：最简单、最通用，任何 agent 都能用 HTTP 工具调
+- 缺点：每个编排器要写一小段调用逻辑
+
+**B. MCP Server（推荐）**
+- 用 Python / Node 的 MCP SDK 把检索逻辑包成 tool（如 `kb_search`、`kb_get_source`）
+- 优点：**工具自动发现**，编排器零配置即可用；换编排器不用改知识库代码
+- 缺点：多一层协议
+
+**C. 把企业知识库塞进 OpenClaw 自己的 memory 体系**
+- ⚠️ **不推荐**（若要保持编排层可换）
+- OpenClaw 的 memory 绑在它的会话 / agent 模型上（MEMORY.md、workspace、dreaming），换编排器就用不了了
+
+### 9.5 关键决策
+
+> **MCP 与 HTTP API 两个都留，不要互相替代。**
+> MCP 面向 **agent**（需要工具自动发现）；HTTP 面向 **系统**（同步任务、批处理、其他服务调用、运维排查）。
+> `rag-kb` 现有的 HTTP API 保持不动，MCP 只是套一层壳。
+
+**并且：OpenClaw 自己的 memory 体系保持原样**，专门放"我的个人记忆"，不要把企业知识混进去。
+两者职责不同、生命周期不同、权限模型不同。
+
+### 9.6 各编排器接入方式
+
+**OpenClaw（作为客户端）**
+```bash
+openclaw mcp add corp-kb \
+  --url https://kb.internal/mcp \
+  --transport streamable-http \
+  --include 'kb_search,kb_get_source'
+openclaw mcp doctor corp-kb --probe     # 保存定义 ≠ 可达，probe 才算数
+```
+（顶层 `mcp.servers`；与 `nodeHost.mcp.servers` 是两处不同配置。）
+
+**Codex（作为客户端）**
+```bash
+codex mcp add corp-kb --url https://kb.internal/mcp
+```
+
+**自建 agent**
+- 优先用 MCP SDK 直连
+- 集成成本最低时用 HTTP API + 一个轻量 skill
+
+**OpenClaw（作为服务端，被别的客户端编排）**
+```bash
+openclaw mcp serve --token-file /path/to/token
+```
+
+---
+
+## 10. 两条落地路线
 
 ### 路线 A：最小闭环（推荐先做）
 
@@ -311,7 +409,7 @@ OpenClaw 的 memory 库装的是"我的记忆"；企业知识库存的是"公司
 
 ---
 
-## 10. 现实成本提醒
+## 11. 现实成本提醒
 
 - **GPU**：本地 embedding 够用；**重排（rerank）和本地大模型才是显存大头**
 - **运维**：RAGFlow 那套（ES+MySQL+MinIO+Redis+主服务）起步 5+ 容器；Onyx 也是全套
@@ -321,19 +419,24 @@ OpenClaw 的 memory 库装的是"我的记忆"；企业知识库存的是"公司
 
 ---
 
-## 11. 未决问题（下次继续）
+## 12. 未决问题（下次继续）
 
 1. **商业邮件服务具体是哪个**（Exchange/Graph？腾讯企业邮？Gmail？有没有邮件归档系统？）—— 决定邮件能否接、怎么接
 2. **结构化数据库类型、库数量、是否多租户/行级权限** —— 决定 NL2SQL 方案复杂度
 3. **是否允许另购 GPU 机器** —— 决定多模态是主线还是增强
 4. **MinerU 商用许可阈值是否触及** —— 决定能否直接用
 5. **制度文档的切分粒度要求** —— 决定切分是否必须自建
+6. **编排层最终选谁** —— 决定知识服务的接口优先级（MCP 为主还是 HTTP 为主）
+7. **是否需要多个编排器共用同一份索引** —— 决定身份 token 与审计模型的设计
 
 ---
 
 ## 附：关键事实来源
 
-- OpenClaw 文档 `docs/nodes/mcp-and-skills.md`（远程 MCP 接入方式）
+- OpenClaw 文档 `docs/nodes/mcp-and-skills.md`（node-hosted MCP v1，**明确不支持 OAuth**）
+- OpenClaw 文档 `docs/tools/mcp.md`（顶层 `mcp.servers` 接入方式；含 `openclaw mcp serve` 反向暴露）
+- OpenClaw config schema `.properties.mcp.properties.servers`（含 `oauth`/`toolFilter`/`codex` 等字段）
+- 本机 `codex mcp add --help`（codex-cli 0.162.1，支持 `--url` 接 streamable HTTP）
 - OpenClaw 文档 `docs/gateway/config-agents/models.md`（`agents.defaults.imageModel` 等模型路由）
 - 本机实测：`openclaw memory status --index`、SQLite `memory_index_chunks` 表统计
 - 源码：`dist/chunk-*.mjs`（切块）、`dist/embedding-chunk-limits-*.mjs`（token 上限）
